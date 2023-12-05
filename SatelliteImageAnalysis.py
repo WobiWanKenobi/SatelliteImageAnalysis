@@ -5,31 +5,64 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.optim.lr_scheduler import OneCycleLR
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from torchvision.datasets import ImageFolder
+from torchvision.transforms import RandomRotation, RandomSolarize, RandomInvert
 from torch.utils.data import random_split
 from torchmetrics.classification import Accuracy
 import pytorch_lightning as pl
 from PIL import Image
 import os
+import random
 
 
 #hyperparameters
 batch_size = 2
-epoch = 1
+epoch = 10
 num_classes = 10
 dataset_path = "EuroSAT_RGB/"
 model_checkpoint_path = "checkpoints/best_model.ckpt"
 
 #parameters for data preprocessing
 transform = transforms.Compose([
-    transforms.Resize((256,256)),
+    transforms.Resize((16,16)),
+    transforms.ToTensor(),
+])
+
+#make dataset more diverse by rotating each training image
+augmented_transform = transforms.Compose([
+    RandomRotation(degrees=180),
+    transforms.Resize((16, 16)),
+    transforms.ToTensor(),
+])
+
+threshold = random.randint(0, 256)
+
+solarize_transform = transforms.Compose([
+    RandomSolarize(threshold=threshold, p=1),
+    transforms.Resize((16, 16)),
+    transforms.ToTensor(),
+])
+    
+
+invert_transform = transforms.Compose([
+    RandomInvert(p=1),
+    transforms.Resize((16, 16)),
     transforms.ToTensor(),
 ])
 
 #load dataset
 eurosat_dataset = ImageFolder(root=dataset_path, transform=transform)
+
+augmented_dataset = ImageFolder(root=dataset_path, transform=augmented_transform)
+
+solarize_dataset = ImageFolder(root=dataset_path, transform=solarize_transform)
+
+invert_dataset = ImageFolder(root=dataset_path, transform=invert_transform)
+
+
 
 #split dataset
 train_size = int(0.8 * len(eurosat_dataset))
@@ -40,27 +73,34 @@ train_dataset, val_dataset, test_dataset = random_split(
     eurosat_dataset, [train_size, val_size, test_size]
 )
 
+#concatenate datasets for more diversity
+train_dataset = torch.utils.data.ConcatDataset([eurosat_dataset, augmented_dataset, solarize_dataset, invert_dataset])
+
+
 #data loaders
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True) #add num_workers=... later
 val_loader = DataLoader(val_dataset, batch_size=batch_size)
 test_loader = DataLoader(test_dataset, batch_size=32)
 
+#GELU performt eigentlich so ziemlich genau wie RELU, also man könnte auch ganz standard relu verwenden...
 class LandCoverModel(pl.LightningModule):
     def __init__(self, num_classes=num_classes):
         super(LandCoverModel, self).__init__()
         self.conv1 = nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1)
-        self.relu1 = nn.ReLU()
+        self.relu1 = nn.GELU()
         self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
 
         self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1)
-        self.relu2 = nn.ReLU()
+        self.relu2 = nn.GELU()
         self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
 
         self.conv3 = nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1)
-        self.relu3 = nn.ReLU()
+        self.relu3 = nn.GELU()
         self.pool3 = nn.MaxPool2d(kernel_size=2, stride=2)
 
-        self.fc1 = nn.Linear(128 * 32 * 32, 512)
+        self.pool_output_size = 128 * (16 // 8) * (16 // 8)
+
+        self.fc1 = nn.Linear(self.pool_output_size  , 512)
         self.relu4 = nn.ReLU()
         self.fc2 = nn.Linear(512, num_classes)
 
@@ -70,10 +110,27 @@ class LandCoverModel(pl.LightningModule):
         x = self.pool1(self.relu1(self.conv1(x)))
         x = self.pool2(self.relu2(self.conv2(x)))
         x = self.pool3(self.relu3(self.conv3(x)))
-        x = x.view(-1 ,128 * 32 * 32)
+        #print("Shape before flattening:", x.shape)
+
+        #dynamic calculation of the flattend tensors size
+        #x_size = x.size(1) * x.size(2) * x.size(3)
+
+
+        x = x.view(x.size(0), -1)
+        
         x = self.relu4(self.fc1(x))
         x = self.fc2(x)
         return x
+    
+    def configure_optimizers(self):
+        optimizer = optim.Adam(self.parameters(), lr=1e-4, weight_decay=1e-4) #original weight decay = 1e-5
+        scheduler = OneCycleLR(
+            optimizer,
+            max_lr=0.01, 
+            total_steps=len(train_loader) * epoch,
+            pct_start=0.1, 
+        )
+        return {'optimizer': optimizer, 'lr_scheduler': scheduler, 'monitor': 'val_loss'}
     
     def training_step(self, batch, batch_idx):
         x, y = batch
@@ -82,6 +139,9 @@ class LandCoverModel(pl.LightningModule):
         acc = self.accuracy(outputs, y)
         self.log("train_loss", loss, on_epoch=True)
         self.log("train_acc", acc, on_epoch=True)
+
+        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
+
         return loss
     
     def validation_step(self, batch, batch_idx):
@@ -93,13 +153,11 @@ class LandCoverModel(pl.LightningModule):
         self.log("val_acc", acc, on_epoch=True)
         return loss
     
-    def configure_optimizers(self):
-        return optim.Adam(self.parameters(), lr=1e-4)
     
 #create model
 model = LandCoverModel(num_classes=len(eurosat_dataset.classes))
 
-def train_model():
+def train_model(model):
     valid_input = False
     while not valid_input:
         response = (input("Do you want to train the model again? y/n"))
@@ -150,11 +208,13 @@ def test_own_image():
         #get predicted class label
         _, predicted_class = torch.max(output, 1)
         predicted_class = predicted_class.item()
-        print(f"The predicted class for your input Image is: {predicted_class}") #add dictionary instead of numbers
+        predicted_class_dict = {0: "Annual Crop", 1: "Forest", 2: "Herbaceous Vegetation", 3: "Highway", 4: "Industrial", 5: "Pasture",
+                                6: "Permanent Crop", 7: "Residential", 8: "River", 9: "Sea/Lake" }
+        print(f"The predicted class for your input Image is: {predicted_class_dict[predicted_class]}")
         test_own_image()
     else:
         print("image not found, try again!")
         test_own_image()
 
-train_model()
+train_model(model)
 test_own_image()
