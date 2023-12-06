@@ -9,7 +9,7 @@ from torch.optim.lr_scheduler import OneCycleLR
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from torchvision.datasets import ImageFolder
-from torchvision.transforms import RandomRotation, RandomSolarize, RandomInvert
+from torchvision.transforms.v2 import RandomRotation, RandomSolarize, RandomInvert, ColorJitter, RandomPerspective
 from torch.utils.data import random_split
 from torchmetrics.classification import Accuracy
 import pytorch_lightning as pl
@@ -17,9 +17,8 @@ from PIL import Image
 import os
 import random
 
-
 #hyperparameters
-batch_size = 2
+batch_size = 4
 epoch = 10
 num_classes = 10
 dataset_path = "EuroSAT_RGB/"
@@ -53,6 +52,19 @@ invert_transform = transforms.Compose([
     transforms.ToTensor(),
 ])
 
+dist_scale = random.random()
+brightness = random.random()
+contrast = random.random()
+saturation = random.random()
+hue = (0.0, 0.5)
+
+color_jitter_transform = transforms.Compose([
+    ColorJitter(brightness=brightness, contrast=contrast, saturation=saturation, hue=hue),
+    RandomPerspective(distortion_scale=dist_scale, p=1),
+    transforms.Resize((16,16)),
+    transforms.ToTensor(),
+])
+
 #load dataset
 eurosat_dataset = ImageFolder(root=dataset_path, transform=transform)
 
@@ -61,6 +73,8 @@ augmented_dataset = ImageFolder(root=dataset_path, transform=augmented_transform
 solarize_dataset = ImageFolder(root=dataset_path, transform=solarize_transform)
 
 invert_dataset = ImageFolder(root=dataset_path, transform=invert_transform)
+
+color_jitter_dataset = ImageFolder(root=dataset_path, transform=color_jitter_transform)
 
 
 
@@ -74,7 +88,7 @@ train_dataset, val_dataset, test_dataset = random_split(
 )
 
 #concatenate datasets for more diversity
-train_dataset = torch.utils.data.ConcatDataset([eurosat_dataset, augmented_dataset, solarize_dataset, invert_dataset])
+train_dataset = torch.utils.data.ConcatDataset([eurosat_dataset, augmented_dataset, solarize_dataset, invert_dataset, color_jitter_dataset])
 
 
 #data loaders
@@ -87,20 +101,24 @@ class LandCoverModel(pl.LightningModule):
     def __init__(self, num_classes=num_classes):
         super(LandCoverModel, self).__init__()
         self.conv1 = nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1)
+        self.bn1 = nn.BatchNorm2d(32)
         self.relu1 = nn.GELU()
         self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
 
         self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1)
+        self.bn2 = nn.BatchNorm2d(64)
         self.relu2 = nn.GELU()
         self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
 
         self.conv3 = nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1)
+        self.bn3 = nn.BatchNorm2d(128)
         self.relu3 = nn.GELU()
         self.pool3 = nn.MaxPool2d(kernel_size=2, stride=2)
 
         self.pool_output_size = 128 * (16 // 8) * (16 // 8)
 
         self.fc1 = nn.Linear(self.pool_output_size  , 512)
+        self.bn_fc1 = nn.BatchNorm1d(512)
         self.relu4 = nn.ReLU()
         self.fc2 = nn.Linear(512, num_classes)
 
@@ -123,13 +141,15 @@ class LandCoverModel(pl.LightningModule):
         return x
     
     def configure_optimizers(self):
-        optimizer = optim.Adam(self.parameters(), lr=1e-4, weight_decay=1e-4) #original weight decay = 1e-5
+        optimizer = optim.Adam(self.parameters(), lr=1e-4, weight_decay=1e-5) #original weight decay = 1e-5
         scheduler = OneCycleLR(
             optimizer,
             max_lr=0.01, 
             total_steps=len(train_loader) * epoch,
             pct_start=0.1, 
         )
+        
+        
         return {'optimizer': optimizer, 'lr_scheduler': scheduler, 'monitor': 'val_loss'}
     
     def training_step(self, batch, batch_idx):
