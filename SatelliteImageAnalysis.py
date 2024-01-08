@@ -1,3 +1,17 @@
+# -*- coding: utf-8 -*-
+# pylint: disable=E1101
+"""
+Satellite Image Analysis
+========================
+*Created on 28.11.2023 by Tobias Witte*
+*Copyright (C) 2023*
+*For COPYING and LICENSE details, please refer to the LICENSE file*
+
+This script is able to categorize optical satellite images into 10 different classes, eg. River, Highway, Residential, etc.
+You can train, test and modify this convolutional neural network yourself. For further Information check the "README.md" file.
+"""
+
+
 import os
 import random
 import shutil
